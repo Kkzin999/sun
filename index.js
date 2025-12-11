@@ -1,4 +1,13 @@
-console.log('Bot subiu. Pelo menos o deploy funcionou.');
-setInterval(() => {
-  console.log('Ainda vivo no Railway...');
-}, 30000);
+import 'dotenv/config';
+import { Client, GatewayIntentBits } from 'discord.js';
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+client.once("ready", () => {
+  console.log(`Bot online como: ${client.user.tag}`);
+});
+
+client.login(process.env.DISCORD_TOKEN);
+
