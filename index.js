@@ -6,6 +6,7 @@ const { Pool } = pkg;
 
 // ===== ENV =====
 const { DISCORD_TOKEN, DATABASE_URL } = process.env;
+const AUTO_ROLE_ID = "1448622830211305674";
 
 if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN não definido");
 if (!DATABASE_URL) throw new Error("DATABASE_URL não definido");
@@ -30,6 +31,7 @@ async function initTestTable() {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
   ]
@@ -71,6 +73,21 @@ client.on("messageCreate", async (message) => {
   } catch (err) {
     console.error("Erro no banco:", err);
     message.reply("❌ Erro ao acessar o banco.");
+  }
+});
+
+client.on("guildMemberAdd", async (member) => {
+  const role = member.guild.roles.cache.get(AUTO_ROLE_ID);
+  if (!role) {
+    console.error(`Cargo ${AUTO_ROLE_ID} não encontrado no servidor ${member.guild.id}`);
+    return;
+  }
+
+  try {
+    await member.roles.add(role);
+    console.log(`Cargo ${AUTO_ROLE_ID} aplicado a ${member.user.tag}`);
+  } catch (err) {
+    console.error(`Erro ao aplicar cargo para ${member.user.tag}:`, err);
   }
 });
 
