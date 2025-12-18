@@ -8,6 +8,7 @@ const { Pool } = pkg;
 const { DISCORD_TOKEN, DATABASE_URL, BOT_PREFIX } = process.env;
 const AUTO_ROLE_ID = "1448622830211305674";
 const PREFIX = BOT_PREFIX || "*";
+const COMMAND_OWNER_ID = "1288921463792861256";
 const ROLE_REWARDS = [
   { level: 1, roleId: "1448628943300329472" },
   { level: 5, roleId: "1448629507690074172" },
@@ -506,8 +507,8 @@ client.on("messageCreate", async (message) => {
     }
 
     if (["add", "remove", "set"].includes(command.toLowerCase())) {
-      if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de gerenciar o servidor." }).setColor(0xED4245)] });
+      if (message.author.id !== COMMAND_OWNER_ID) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Acesso negado", description: "Somente o proprietario autorizado pode usar este comando." }).setColor(0xED4245)] });
       }
 
       const mode = command.toLowerCase();
