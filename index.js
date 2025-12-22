@@ -9,6 +9,7 @@ const { DISCORD_TOKEN, DATABASE_URL, BOT_PREFIX } = process.env;
 const AUTO_ROLE_ID = "1448622830211305674";
 const PREFIX = BOT_PREFIX || "!";
 const COMMAND_OWNER_ID = "1288921463792861256";
+const EMBED_COLOR = 0xffffff;
 const ROLE_REWARDS = [
   { level: 1, roleId: "1448628943300329472" },
   { level: 5, roleId: "1448629507690074172" },
@@ -71,6 +72,51 @@ const CLASS_CONFIG = {
   }
 };
 
+const RARITY_ORDER = ["Comum", "Rara", "Épica", "Lendária", "Mística"];
+const RARITY_RULES = {
+  Comum: { xpForNext: 10, maxLevel: 25, upgradeTo: "Rara" },
+  Rara: { xpForNext: 20, maxLevel: 10, upgradeTo: "Épica" },
+  "Épica": { xpForNext: 50, maxLevel: 5, upgradeTo: "Lendária" },
+  "Lendária": { xpForNext: 1000, maxLevel: 1, upgradeTo: "Mística" },
+  "Mística": { xpForNext: Infinity, maxLevel: 999 }
+};
+
+const SPELL_LIBRARY = {
+  muralha: {
+    id: "muralha",
+    name: "Muralha",
+    baseCost: 30,
+    basePower: 100,
+    rarity: "Comum",
+    type: "shield",
+    description: "Cria uma barreira protetora."
+  },
+  morcego: {
+    id: "morcego",
+    name: "Morcego Espectral",
+    baseCost: 50,
+    basePower: 30,
+    rarity: "Rara",
+    type: "lifesteal",
+    description: "Bate e rouba parte do dano como HP."
+  },
+  descarga: {
+    id: "descarga",
+    name: "Descarga Elétrica",
+    baseCost: 5,
+    basePower: 20,
+    rarity: "Comum",
+    type: "damage",
+    description: "Golpe rápido de eletricidade."
+  }
+};
+
+const DEFAULT_SPELL_SLOTS = [
+  { slot: 1, spellId: "muralha" },
+  { slot: 2, spellId: "morcego" },
+  { slot: 3, spellId: "descarga" }
+];
+
 if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN nao definido");
 if (!DATABASE_URL) throw new Error("DATABASE_URL nao definido");
 
@@ -120,6 +166,19 @@ async function initTables() {
       type TEXT NOT NULL, -- ban | mute
       ends_at TIMESTAMPTZ,
       reason TEXT
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_spells (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      slot INTEGER NOT NULL,
+      spell_id TEXT NOT NULL,
+      level INTEGER NOT NULL DEFAULT 1,
+      xp INTEGER NOT NULL DEFAULT 0,
+      rarity TEXT NOT NULL DEFAULT 'Comum',
+      locked BOOLEAN NOT NULL DEFAULT FALSE,
+      PRIMARY KEY (guild_id, user_id, slot)
     )
   `);
   await pool.query(`ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS tk INTEGER NOT NULL DEFAULT 0`);
@@ -244,7 +303,7 @@ function formatDuration(ms) {
   return parts.join(", ");
 }
 
-function buildActionEmbed({ title, description, fields = [], color = 0x5865f2 }) {
+function buildActionEmbed({ title, description, fields = [], color = EMBED_COLOR }) {
   return new EmbedBuilder()
     .setColor(color)
     .setTitle(title)
@@ -358,7 +417,10 @@ async function setUserClass(guildId, userId, classKey) {
   if (!stats) return null;
 
   const current = await getUserProgress(guildId, userId);
-  return upsertUserProgress(
+  if (current.class && current.class !== "0") {
+    return { locked: true, currentClass: current.class };
+  }
+  const updated = await upsertUserProgress(
     guildId,
     userId,
     current.xp,
@@ -372,6 +434,248 @@ async function setUserClass(guildId, userId, classKey) {
     stats.def,
     stats.mana
   );
+  if (key === "mago") {
+    await ensureSpellSlots(guildId, userId);
+  }
+  return updated;
+}
+
+function resolveSpellId(name) {
+  if (!name) return null;
+  const normalized = name.toLowerCase();
+  if (normalized.startsWith("mural")) return "muralha";
+  if (normalized.startsWith("morce")) return "morcego";
+  if (normalized.startsWith("desc")) return "descarga";
+  return SPELL_LIBRARY[normalized] ? normalized : null;
+}
+
+function getRarityInfo(rarity) {
+  return RARITY_RULES[rarity] || RARITY_RULES.Comum;
+}
+
+function upgradeRarity(rarity) {
+  const info = getRarityInfo(rarity);
+  return info.upgradeTo || rarity;
+}
+
+function computeSpellScaling(spell) {
+  const base = SPELL_LIBRARY[spell.spell_id];
+  if (!base) return null;
+  const level = spell.level || 1;
+  const cost = Math.round(base.baseCost * Math.pow(1.5, level - 1));
+  const power = Math.round(base.basePower * Math.pow(1.25, level - 1));
+  return { cost, power, base };
+}
+
+function gainSpellXp(spell, amount) {
+  if (!spell || spell.locked) return spell;
+  let newXp = (spell.xp || 0) + amount;
+  let newLevel = spell.level || 1;
+  let newRarity = spell.rarity || SPELL_LIBRARY[spell.spell_id]?.rarity || "Comum";
+  let locked = spell.locked || false;
+  let changed = false;
+
+  while (!locked) {
+    const rarityInfo = getRarityInfo(newRarity);
+    if (newRarity === "Lendária" && newXp >= 1000) {
+      newRarity = "Mística";
+      locked = true;
+      newXp = 0;
+      changed = true;
+      break;
+    }
+    if (newLevel >= rarityInfo.maxLevel) {
+      const nextRarity = upgradeRarity(newRarity);
+      if (nextRarity === newRarity) {
+        locked = true;
+        break;
+      }
+      newRarity = nextRarity;
+      locked = true;
+      newXp = 0;
+      changed = true;
+      break;
+    }
+    if (newXp < rarityInfo.xpForNext) break;
+    newXp -= rarityInfo.xpForNext;
+    newLevel += 1;
+    changed = true;
+  }
+
+  return { ...spell, xp: newXp, level: newLevel, rarity: newRarity, locked };
+}
+
+async function ensureSpellSlots(guildId, userId) {
+  const { rows } = await pool.query(
+    `SELECT slot, spell_id, level, xp, rarity, locked FROM user_spells WHERE guild_id = $1 AND user_id = $2 ORDER BY slot`,
+    [guildId, userId]
+  );
+  if (rows.length >= 3) return rows;
+
+  const existingSlots = new Set(rows.map((r) => r.slot));
+  const inserts = [];
+  for (const def of DEFAULT_SPELL_SLOTS) {
+    if (!existingSlots.has(def.slot)) {
+      inserts.push(
+        pool.query(
+          `INSERT INTO user_spells (guild_id, user_id, slot, spell_id, level, xp, rarity, locked) VALUES ($1, $2, $3, $4, 1, 0, $5, FALSE)
+           ON CONFLICT (guild_id, user_id, slot) DO NOTHING`,
+          [guildId, userId, def.slot, def.spellId, SPELL_LIBRARY[def.spellId].rarity]
+        )
+      );
+    }
+  }
+  if (inserts.length) await Promise.all(inserts);
+  const refreshed = await pool.query(
+    `SELECT slot, spell_id, level, xp, rarity, locked FROM user_spells WHERE guild_id = $1 AND user_id = $2 ORDER BY slot`,
+    [guildId, userId]
+  );
+  return refreshed.rows;
+}
+
+async function setSpellSlot(guildId, userId, slot, spellId) {
+  const base = SPELL_LIBRARY[spellId];
+  if (!base) return null;
+  await pool.query(
+    `
+    INSERT INTO user_spells (guild_id, user_id, slot, spell_id, level, xp, rarity, locked)
+    VALUES ($1, $2, $3, $4, 1, 0, $5, FALSE)
+    ON CONFLICT (guild_id, user_id, slot)
+    DO UPDATE SET spell_id = EXCLUDED.spell_id, level = 1, xp = 0, rarity = $5, locked = FALSE
+    `,
+    [guildId, userId, slot, spellId, base.rarity]
+  );
+  const { rows } = await pool.query(
+    `SELECT slot, spell_id, level, xp, rarity, locked FROM user_spells WHERE guild_id = $1 AND user_id = $2 AND slot = $3`,
+    [guildId, userId, slot]
+  );
+  return rows[0];
+}
+
+async function saveSpellProgress(guildId, userId, spell) {
+  if (!spell) return;
+  await pool.query(
+    `UPDATE user_spells SET level = $1, xp = $2, rarity = $3, locked = $4 WHERE guild_id = $5 AND user_id = $6 AND slot = $7`,
+    [spell.level, spell.xp, spell.rarity, spell.locked, guildId, userId, spell.slot]
+  );
+}
+
+const OPPONENTS = [
+  { name: "Macaco", minPower: 0, maxPower: 50, atk: 5, def: 0, hp: 50, loot: 10, attackInterval: 5 },
+  { name: "Tigre", minPower: 50, maxPower: 100, atk: 15, def: 0, hp: 75, loot: 50, attackInterval: 3 },
+  { name: "Leão", minPower: 100, maxPower: 150, atk: 20, def: 0, hp: 150, loot: 100, attackInterval: 6 },
+  { name: "Caçador", minPower: 150, maxPower: 200, atk: 100, def: 20, hp: 200, loot: 300, attackInterval: 5 }
+];
+
+const battleSessions = new Map();
+
+async function getUserSpells(guildId, userId) {
+  const rows = await ensureSpellSlots(guildId, userId);
+  return rows;
+}
+
+function spellContribution(spell) {
+  const scaled = computeSpellScaling(spell);
+  if (!scaled) return 0;
+  return scaled.power * 2 + scaled.cost;
+}
+
+function computeUserPower(progress, spells) {
+  let power = (progress.hp || BASE_STATS.hp) * 0.4 + (progress.atk || 0) * 5 + (progress.def || 0) * 3;
+  if (progress.mana) power += progress.mana * 0.2;
+  for (const sp of spells || []) {
+    power += spellContribution(sp);
+  }
+  return Math.max(0, Math.round(power));
+}
+
+function pickOpponent(power) {
+  const match = OPPONENTS.find((o) => power >= o.minPower && power <= o.maxPower) || OPPONENTS[OPPONENTS.length - 1];
+  return { ...match };
+}
+
+async function updateUserVitals(guildId, userId, hp, mana, moneyDelta = 0) {
+  const current = await getUserProgress(guildId, userId);
+  const newHp = Math.max(0, Math.min(hp, current.hpm));
+  const newMana = Math.max(0, mana);
+  const newMoney = Math.max(0, current.money + moneyDelta);
+  await upsertUserProgress(
+    guildId,
+    userId,
+    current.xp,
+    current.level,
+    current.tk,
+    newMoney,
+    current.class,
+    newHp,
+    current.hpm,
+    current.atk,
+    current.def,
+    newMana
+  );
+  return { ...current, hp: newHp, mana: newMana, money: newMoney };
+}
+
+function describeSpell(spell) {
+  const scaled = computeSpellScaling(spell);
+  if (!scaled) return "Magia desconhecida.";
+  const needed = getRarityInfo(spell.rarity).xpForNext === Infinity ? "infinito" : getRarityInfo(spell.rarity).xpForNext;
+  return `${scaled.base.name} | Raridade: ${spell.rarity} | Nivel: ${spell.level} | XP: ${spell.xp}/${needed} | Custo: ${scaled.cost} mana | Poder: ${scaled.power}`;
+}
+
+function hasBattle(userId) {
+  return battleSessions.has(userId);
+}
+
+async function endBattle(userId, reason, channel) {
+  const session = battleSessions.get(userId);
+  if (session) {
+    battleSessions.delete(userId);
+    if (reason && channel) {
+      await channel.send({
+        embeds: [
+          buildActionEmbed({
+            title: "Batalha encerrada",
+            description: reason
+          })
+        ]
+      });
+    }
+  }
+}
+
+async function processBattles(client) {
+  const now = Date.now();
+  for (const session of battleSessions.values()) {
+    if (now >= session.nextAttackAt) {
+      const channel = client.channels.cache.get(session.channelId) || await client.channels.fetch(session.channelId).catch(() => null);
+      if (!channel) {
+        battleSessions.delete(session.userId);
+        continue;
+      }
+      let incoming = session.opponent.atk;
+      if (session.shield > 0) {
+        const absorbed = Math.min(session.shield, incoming);
+        incoming -= absorbed;
+        session.shield -= absorbed;
+      }
+      const damage = Math.max(0, incoming - session.playerDef);
+      session.playerHp = Math.max(0, session.playerHp - damage);
+      await updateUserVitals(session.guildId, session.userId, session.playerHp, session.playerMana);
+      session.nextAttackAt = now + session.opponent.attackInterval * 1000;
+      await channel.send({
+        embeds: [
+          buildActionEmbed({
+            title: `${session.opponent.name} atacou!`,
+            description: `Dano sofrido: ${damage}. HP restante: ${session.playerHp}.`
+          })
+        ]
+      });
+      if (session.playerHp <= 0) {
+        await endBattle(session.userId, "Voce foi derrotado.", channel);
+      }
+    }
+  }
 }
 
 // ===== INVITER =====
@@ -587,6 +891,7 @@ client.once("ready", async () => {
   }
 
   setInterval(() => processExpiredPunishments(client), 30_000);
+  setInterval(() => processBattles(client), 1000);
 });
 
 client.on("messageCreate", async (message) => {
@@ -600,9 +905,220 @@ client.on("messageCreate", async (message) => {
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const command = args.shift();
     if (!command) return;
+    const lowerCmd = command.toLowerCase();
 
-    if (command.toLowerCase() === "perfil") {
-      const { xp, level, tk, money, hp, hpm, atk, def, class: charClass, mana } = await getUserProgress(message.guild.id, message.author.id);
+    if (lowerCmd === "me") {
+      const { hp, hpm, atk, def, money, class: charClass, mana } = await getUserProgress(message.guild.id, message.author.id);
+      const embed = new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setAuthor({ name: message.author.username, iconURL: message.author.displayAvatarURL() })
+        .setTitle("Meus atributos")
+        .addFields(
+          { name: "HP", value: `${hp}/${hpm}`, inline: true },
+          { name: "ATK", value: `${atk}`, inline: true },
+          { name: "DEF", value: `${def}`, inline: true },
+          { name: "ĐY'æ", value: `${money}`, inline: true },
+          { name: "Classe", value: charClass || "Nenhuma", inline: true },
+          { name: "Mana", value: `${mana}`, inline: true }
+        )
+        .setTimestamp();
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (lowerCmd === "inventario") {
+      const progress = await getUserProgress(message.guild.id, message.author.id);
+      const spells = progress.class?.toLowerCase() === "mago" ? await getUserSpells(message.guild.id, message.author.id) : [];
+      const spellLines = spells.map((sp) => `Slot ${sp.slot}: ${describeSpell(sp)}`);
+      const embed = new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setAuthor({ name: message.author.username, iconURL: message.author.displayAvatarURL() })
+        .setTitle("Inventário")
+        .setDescription(spellLines.length ? spellLines.join("\n") : "Sem magias.")
+        .addFields(
+          { name: "Itens", value: "Armas e equipamentos: sem itens registrados ainda." },
+          { name: "Moedas", value: `ĐY'æ: ${progress.money}` }
+        )
+        .setTimestamp();
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (lowerCmd === "magias") {
+      const progress = await getUserProgress(message.guild.id, message.author.id);
+      if (progress.class?.toLowerCase() !== "mago") {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Somente magos", description: "Apenas magos podem ver magias." })] });
+      }
+      const spells = await getUserSpells(message.guild.id, message.author.id);
+      const lines = spells.map((sp) => `Magia ${sp.slot}: ${describeSpell(sp)}`);
+      const embed = new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setTitle("MAGIAS")
+        .setDescription([
+          "Magia 1: Muralha - nivel 1 (padrao)",
+          "Magia 2: Morcego Espectral - nivel 1 (padrao)",
+          "Magia 3: Descarga Eletrica - nivel 1 (padrao)",
+          "",
+          "Use !m1, !m2 ou !m3 para conjurar.",
+          "Veja detalhes com !m1 info, !m2 info, !m3 info.",
+          "Troque as magias com !m1 set <magia>, !m2 set <magia>, !m3 set <magia>.",
+          "",
+          "Regras: cada magia tem raridade e nivel proprios. Evoluir aumenta custo em 50% e efeito em 25% por nivel.",
+          "Ao chegar no nivel maximo, a magia sobe de raridade (Comum -> Rara -> Épica -> Lendária -> Mística) e trava."
+        ].join("\n"))
+        .addFields(
+          { name: "Suas magias", value: lines.join("\n") },
+          { name: "Progresso", value: "Raridades: Comum, Rara, Épica, Lendária, Mística.\nXP: Comum 10xp lvl2 (max 25), Rara 20xp lvl2 (max 10), Épica 50xp lvl2 (max 5). Lendária vira Mística ao chegar em 1000xp. Mística nivel 999 sem xp.\nGanho de XP: +1 por uso de magia, +2 por eliminação com magia." }
+        )
+        .setTimestamp();
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (["m1", "m2", "m3"].includes(lowerCmd)) {
+      const slot = parseInt(lowerCmd.slice(1), 10);
+      const progress = await getUserProgress(message.guild.id, message.author.id);
+      if (progress.class?.toLowerCase() !== "mago") {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Somente magos", description: "Apenas magos podem usar magias." })] });
+      }
+      if (hasBattle(message.author.id) && args[0] && args[0].toLowerCase() === "set") {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Batalha ativa", description: "Nao e possivel trocar magias durante a batalha." })] });
+      }
+      const spells = await getUserSpells(message.guild.id, message.author.id);
+      const currentSpell = spells.find((sp) => sp.slot === slot);
+
+      const sub = (args[0] || "").toLowerCase();
+      if (sub === "info") {
+        if (!currentSpell) {
+          return message.reply({ embeds: [buildActionEmbed({ title: "Magia nao configurada", description: "Defina uma magia primeiro." })] });
+        }
+        return message.reply({ embeds: [buildActionEmbed({ title: `Magia ${slot}`, description: describeSpell(currentSpell) })] });
+      }
+
+      if (sub === "set") {
+        const desired = resolveSpellId(args[1]);
+        if (!desired) {
+          return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `Use ${PREFIX}m${slot} set <muralha|morcego|descarga>` })] });
+        }
+        const updatedSpell = await setSpellSlot(message.guild.id, message.author.id, slot, desired);
+        return message.reply({ embeds: [buildActionEmbed({ title: `Magia ${slot} atualizada`, description: describeSpell(updatedSpell) })] });
+      }
+
+      if (!hasBattle(message.author.id)) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Sem batalha", description: "Inicie com !caçar antes de usar magias." })] });
+      }
+      if (!currentSpell) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Magia nao configurada", description: "Defina uma magia com o subcomando set." })] });
+      }
+
+      const session = battleSessions.get(message.author.id);
+      const scaled = computeSpellScaling(currentSpell);
+      if (!scaled) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Magia invalida", description: "Nao consegui ler essa magia." })] });
+      }
+      if (session.playerMana < scaled.cost) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Mana insuficiente", description: `Custo: ${scaled.cost}. Mana atual: ${session.playerMana}.` })] });
+      }
+
+      session.playerMana -= scaled.cost;
+      let desc = "";
+      if (scaled.base.type === "shield") {
+        session.shield += scaled.power;
+        desc = `Barreira ativada com ${scaled.power} de protecao. Escudo atual: ${session.shield}.`;
+      } else if (scaled.base.type === "lifesteal") {
+        const raw = Math.max(0, scaled.power - session.opponent.def);
+        session.opponentHp = Math.max(0, session.opponentHp - raw);
+        const heal = Math.round(raw * 0.5);
+        session.playerHp = Math.min(session.playerHp + heal, session.playerHpm);
+        desc = `Dano causado: ${raw}. Vida recuperada: ${heal}. HP: ${session.playerHp}/${session.playerHpm}.`;
+      } else {
+        const raw = Math.max(0, scaled.power - session.opponent.def);
+        session.opponentHp = Math.max(0, session.opponentHp - raw);
+        desc = `Dano causado: ${raw}. HP do oponente: ${session.opponentHp}/${session.opponentMaxHp}.`;
+      }
+
+      const progressed = gainSpellXp(currentSpell, 1);
+      await saveSpellProgress(message.guild.id, message.author.id, progressed);
+      battleSessions.set(message.author.id, { ...session, lastSpellUsed: slot });
+      await updateUserVitals(message.guild.id, message.author.id, session.playerHp, session.playerMana);
+
+      if (session.opponentHp <= 0) {
+        const reward = session.opponent.loot;
+        const spellWin = gainSpellXp(progressed, 2);
+        await saveSpellProgress(message.guild.id, message.author.id, spellWin);
+        await updateUserVitals(message.guild.id, message.author.id, session.playerHp, session.playerMana, reward);
+        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} ĐY'æ adicionado ao inventario.`, message.channel);
+        return;
+      }
+
+      const embed = buildActionEmbed({
+        title: `Magia ${slot} usada`,
+        description: `${scaled.base.name} - custo ${scaled.cost} mana.`,
+        fields: [
+          { name: "Efeito", value: desc },
+          { name: "Mana restante", value: `${session.playerMana}` }
+        ]
+      });
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (lowerCmd === "caçar" || lowerCmd === "cacar") {
+      if (hasBattle(message.author.id)) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Batalha em andamento", description: "Finalize a luta antes de caçar novamente." })] });
+      }
+      const progress = await getUserProgress(message.guild.id, message.author.id);
+      const spells = progress.class?.toLowerCase() === "mago" ? await getUserSpells(message.guild.id, message.author.id) : [];
+      const power = computeUserPower(progress, spells);
+      const opponent = pickOpponent(power);
+
+      const session = {
+        userId: message.author.id,
+        guildId: message.guild.id,
+        channelId: message.channel.id,
+        opponent,
+        opponentHp: opponent.hp,
+        opponentMaxHp: opponent.hp,
+        playerHp: progress.hp || progress.hpm,
+        playerHpm: progress.hpm,
+        playerMana: progress.mana || 0,
+        playerAtk: progress.atk,
+        playerDef: progress.def,
+        playerClass: progress.class,
+        shield: 0,
+        nextAttackAt: Date.now() + opponent.attackInterval * 1000
+      };
+      battleSessions.set(message.author.id, session);
+
+      const embed = buildActionEmbed({
+        title: "Caçada iniciada",
+        description: `Oponente encontrado: **${opponent.name}**`,
+        fields: [
+          { name: "Poder avaliado", value: `${power}`, inline: true },
+          { name: "Alvo", value: `${opponent.hp} HP | ${opponent.atk} ATK | ${opponent.def} DEF`, inline: true },
+          { name: "Loot", value: `${opponent.loot} ĐY'æ`, inline: true },
+          { name: "Dicas", value: "Use !atk para ataques basicos e !m1/!m2/!m3 para magias. O oponente ataca automaticamente." }
+        ]
+      });
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (lowerCmd === "atk") {
+      if (!hasBattle(message.author.id)) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Sem batalha", description: "Use !caçar para iniciar uma luta." })] });
+      }
+      const session = battleSessions.get(message.author.id);
+      const damage = Math.max(0, session.playerAtk - session.opponent.def);
+      session.opponentHp = Math.max(0, session.opponentHp - damage);
+      let desc = `Dano causado: ${damage}. HP do oponente: ${session.opponentHp}/${session.opponentMaxHp}.`;
+      if (session.opponentHp <= 0) {
+        const reward = session.opponent.loot;
+        await updateUserVitals(message.guild.id, message.author.id, session.playerHp, session.playerMana, reward);
+        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} ĐY'æ adicionado ao inventario.`, message.channel);
+        return;
+      }
+      battleSessions.set(message.author.id, session);
+      return message.reply({ embeds: [buildActionEmbed({ title: "Ataque basico", description: desc })] });
+    }
+
+    if (lowerCmd === "perfil") {
+      const { xp, level, tk, money } = await getUserProgress(message.guild.id, message.author.id);
       const nextLevel = level + 1;
       const nextLevelXp = xpForLevel(nextLevel);
       const toNext = nextLevelXp - xp;
@@ -612,20 +1128,11 @@ client.on("messageCreate", async (message) => {
         { name: "Nivel", value: `${level}`, inline: true },
         { name: "Para o proximo", value: `${toNext} XP`, inline: true },
         { name: "TK", value: `${tk}`, inline: true },
-        { name: "💵", value: `${money}`, inline: true },
-        { name: "HP", value: `${hp}/${hpm}`, inline: true },
-        { name: "ATK", value: `${atk}`, inline: true },
-        { name: "DEF", value: `${def}`, inline: true }
+        { name: "ĐY'æ", value: `${money}`, inline: true }
       ];
-      if (mana > 0) {
-        fields.push({ name: "Mana", value: `${mana}`, inline: true });
-      }
-      if (charClass && charClass !== "0") {
-        fields.push({ name: "Classe", value: charClass, inline: true });
-      }
 
       const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
+        .setColor(EMBED_COLOR)
         .setAuthor({ name: message.author.username, iconURL: message.author.displayAvatarURL() })
         .setTitle("Perfil")
         .addFields(fields)
@@ -634,12 +1141,16 @@ client.on("messageCreate", async (message) => {
 
       return message.reply({ embeds: [embed] });
     }
-
     if (command.toLowerCase() === "start") {
+      const currentProfile = await getUserProgress(message.guild.id, message.author.id);
+      if (currentProfile.class && currentProfile.class !== "0") {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Classe ja escolhida", description: `Voce ja escolheu: ${currentProfile.class}. A escolha e unica.` }).setColor(EMBED_COLOR)] });
+      }
+
       const classKey = (args[0] || "").toLowerCase();
       if (!classKey) {
         const embed = new EmbedBuilder()
-          .setColor(0x57F287)
+          .setColor(EMBED_COLOR)
           .setTitle("RPG - Escolha sua classe")
           .setDescription(`Use \`${PREFIX}start <classe>\` para escolher. Classes: arqueiro, assassino, militar, mago.`)
           .addFields(
@@ -653,7 +1164,10 @@ client.on("messageCreate", async (message) => {
 
       const updated = await setUserClass(message.guild.id, message.author.id, classKey);
       if (!updated) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Classe invalida", description: "Use arqueiro, assassino, militar ou mago." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Classe invalida", description: "Use arqueiro, assassino, militar ou mago." }).setColor(EMBED_COLOR)] });
+      }
+      if (updated.locked) {
+        return message.reply({ embeds: [buildActionEmbed({ title: "Classe ja escolhida", description: `Voce ja escolheu: ${updated.currentClass}. A escolha e unica.` }).setColor(EMBED_COLOR)] });
       }
 
       const embed = buildActionEmbed({
@@ -665,18 +1179,18 @@ client.on("messageCreate", async (message) => {
           { name: "DEF", value: `${updated.def}`, inline: true },
           { name: "Mana", value: `${updated.mana}`, inline: true }
         ]
-      }).setColor(0x57F287);
+      }).setColor(EMBED_COLOR);
       return message.reply({ embeds: [embed] });
     }
 
     if (command.toLowerCase() === "ban") {
       if (!message.member.permissions.has(PermissionFlagsBits.BanMembers)) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de banir membros." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de banir membros." }).setColor(EMBED_COLOR)] });
       }
 
       const targetId = (message.mentions.users.first()?.id) || args.shift();
       if (!targetId) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}ban @usuario <tempo opcional> <motivo>` }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}ban @usuario <tempo opcional> <motivo>` }).setColor(EMBED_COLOR)] });
       }
 
       const maybeDuration = args[0];
@@ -689,7 +1203,7 @@ client.on("messageCreate", async (message) => {
         await message.guild.members.ban(targetId, { reason });
       } catch (err) {
         console.error("Erro ao banir:", err);
-        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao banir", description: "Nao consegui banir o usuario." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao banir", description: "Nao consegui banir o usuario." }).setColor(EMBED_COLOR)] });
       }
 
       if (hasDuration) {
@@ -714,7 +1228,7 @@ client.on("messageCreate", async (message) => {
 
     if (["add", "remove", "set"].includes(command.toLowerCase())) {
       if (message.author.id !== COMMAND_OWNER_ID) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Acesso negado", description: "Somente o proprietario autorizado pode usar este comando." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Acesso negado", description: "Somente o proprietario autorizado pode usar este comando." }).setColor(EMBED_COLOR)] });
       }
 
       const mode = command.toLowerCase();
@@ -731,7 +1245,7 @@ client.on("messageCreate", async (message) => {
             buildActionEmbed({
               title: "Variavel inexistente",
               description: "Essa variavel nao existe. Use tk, money, xp, hp, hpm, atk, def, mana ou class."
-            }).setColor(0xED4245)
+            }).setColor(EMBED_COLOR)
           ]
         });
       }
@@ -742,7 +1256,7 @@ client.on("messageCreate", async (message) => {
             buildActionEmbed({
               title: "Nivel bloqueado",
               description: "Nivel nao pode ser alterado diretamente."
-            }).setColor(0xED4245)
+            }).setColor(EMBED_COLOR)
           ]
         });
       }
@@ -753,7 +1267,7 @@ client.on("messageCreate", async (message) => {
             buildActionEmbed({
               title: "Classe",
               description: "Use apenas o modo set para classe."
-            }).setColor(0xED4245)
+            }).setColor(EMBED_COLOR)
           ]
         });
       }
@@ -765,7 +1279,7 @@ client.on("messageCreate", async (message) => {
             buildActionEmbed({
               title: "Uso",
               description: `${PREFIX}${mode} variavel valor @usuario\nVariaveis: tk, money, xp, hp, hpm, atk, def, mana, class\nExemplo classe: ${PREFIX}set class Mago @usuario`
-            }).setColor(0xED4245)
+            }).setColor(EMBED_COLOR)
           ]
         });
       }
@@ -781,7 +1295,7 @@ client.on("messageCreate", async (message) => {
               buildActionEmbed({
                 title: "Nivel bloqueado",
                 description: "Nivel nao pode ser alterado diretamente."
-              }).setColor(0xED4245)
+              }).setColor(EMBED_COLOR)
             ]
           });
         }
@@ -791,12 +1305,12 @@ client.on("messageCreate", async (message) => {
               buildActionEmbed({
                 title: "Classe",
                 description: "Classe so pode ser alterada com o modo set."
-              }).setColor(0xED4245)
+              }).setColor(EMBED_COLOR)
             ]
           });
         }
         console.error("Erro ao alterar variavel:", err);
-        return message.reply({ embeds: [buildActionEmbed({ title: "Erro", description: "Nao foi possivel alterar a variavel." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Erro", description: "Nao foi possivel alterar a variavel." }).setColor(EMBED_COLOR)] });
       }
 
       const embed = buildActionEmbed({
@@ -813,21 +1327,21 @@ client.on("messageCreate", async (message) => {
 
     if (command.toLowerCase() === "mute") {
       if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de moderar membros." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de moderar membros." }).setColor(EMBED_COLOR)] });
       }
 
       const targetMember = message.mentions.members.first() || (await message.guild.members.fetch(args[0]).catch(() => null));
       if (!targetMember) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}mute @usuario <tempo> <motivo>` }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}mute @usuario <tempo> <motivo>` }).setColor(EMBED_COLOR)] });
       }
 
       const durationMs = parseDuration(args[1] || args[0]);
       if (!durationMs) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Duracao invalida", description: "Use formatos como 10m, 2h, 3d, 1y (max 100 anos)." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Duracao invalida", description: "Use formatos como 10m, 2h, 3d, 1y (max 100 anos)." }).setColor(EMBED_COLOR)] });
       }
 
       if (durationMs > MAX_TIMEOUT_MS) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Limite do Discord", description: "Timeout nao pode passar de 28 dias." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Limite do Discord", description: "Timeout nao pode passar de 28 dias." }).setColor(EMBED_COLOR)] });
       }
 
       const reasonStartIndex = args[1] ? 2 : 1;
@@ -837,7 +1351,7 @@ client.on("messageCreate", async (message) => {
         await targetMember.timeout(durationMs, reason);
       } catch (err) {
         console.error("Erro ao mutar:", err);
-        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao mutar", description: "Nao consegui aplicar timeout." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao mutar", description: "Nao consegui aplicar timeout." }).setColor(EMBED_COLOR)] });
       }
 
       const endsAt = new Date(Date.now() + durationMs);
@@ -860,12 +1374,12 @@ client.on("messageCreate", async (message) => {
 
     if (command.toLowerCase() === "expulsar" || command.toLowerCase() === "kick") {
       if (!message.member.permissions.has(PermissionFlagsBits.KickMembers)) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de expulsar membros." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Permissao insuficiente", description: "Voce precisa de permissao de expulsar membros." }).setColor(EMBED_COLOR)] });
       }
 
       const targetMember = message.mentions.members.first() || (await message.guild.members.fetch(args[0]).catch(() => null));
       if (!targetMember) {
-        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}expulsar @usuario <motivo>` }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Uso", description: `${PREFIX}expulsar @usuario <motivo>` }).setColor(EMBED_COLOR)] });
       }
 
       const reason = args.slice(1).join(" ") || "Sem motivo";
@@ -874,7 +1388,7 @@ client.on("messageCreate", async (message) => {
         await targetMember.kick(reason);
       } catch (err) {
         console.error("Erro ao expulsar:", err);
-        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao expulsar", description: "Nao consegui expulsar o usuario." }).setColor(0xED4245)] });
+        return message.reply({ embeds: [buildActionEmbed({ title: "Erro ao expulsar", description: "Nao consegui expulsar o usuario." }).setColor(EMBED_COLOR)] });
       }
 
       const embed = buildActionEmbed({
