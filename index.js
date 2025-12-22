@@ -577,12 +577,12 @@ async function getUserSpells(guildId, userId) {
 function spellContribution(spell) {
   const scaled = computeSpellScaling(spell);
   if (!scaled) return 0;
-  return scaled.power * 0.5 + scaled.cost * 0.2;
+  return scaled.power * 0.1 + scaled.cost * 0.05;
 }
 
 function computeUserPower(progress, spells) {
-  let power = (progress.hp || BASE_STATS.hp) * 0.2 + (progress.atk || 0) * 3 + (progress.def || 0) * 2;
-  if (progress.mana) power += progress.mana * 0.05;
+  let power = (progress.hp || BASE_STATS.hp) * 0.05 + (progress.atk || 0) * 1.5 + (progress.def || 0) * 1;
+  if (progress.mana) power += progress.mana * 0.01;
   for (const sp of spells || []) {
     power += spellContribution(sp);
   }
@@ -917,7 +917,7 @@ client.on("messageCreate", async (message) => {
           { name: "HP", value: `${hp}/${hpm}`, inline: true },
           { name: "ATK", value: `${atk}`, inline: true },
           { name: "DEF", value: `${def}`, inline: true },
-          { name: ":dolar:", value: `${money}`, inline: true },
+          { name: "💵", value: `${money}`, inline: true },
           { name: "Classe", value: charClass || "Nenhuma", inline: true },
           { name: "Mana", value: `${mana}`, inline: true }
         )
@@ -936,7 +936,7 @@ client.on("messageCreate", async (message) => {
         .setDescription(spellLines.length ? spellLines.join("\n") : "Sem magias.")
         .addFields(
           { name: "Itens", value: "Armas e equipamentos: sem itens registrados ainda." },
-          { name: "Moedas", value: `:dolar:: ${progress.money}` }
+          { name: "Moedas", value: `💵 ${progress.money}` }
         )
         .setTimestamp();
       return message.reply({ embeds: [embed] });
@@ -1044,7 +1044,7 @@ client.on("messageCreate", async (message) => {
         const spellWin = gainSpellXp(progressed, 2);
         await saveSpellProgress(message.guild.id, message.author.id, spellWin);
         await updateUserVitals(message.guild.id, message.author.id, session.playerHp, session.playerMana, reward);
-        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} :dolar: adicionado ao inventario.`, message.channel);
+        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} 💵 adicionado ao inventario.`, message.channel);
         return;
       }
 
@@ -1092,7 +1092,7 @@ client.on("messageCreate", async (message) => {
         fields: [
           { name: "Poder avaliado", value: `${power}`, inline: true },
           { name: "Alvo", value: `${opponent.hp} HP | ${opponent.atk} ATK | ${opponent.def} DEF`, inline: true },
-          { name: "Loot", value: `${opponent.loot} :dolar:`, inline: true },
+          { name: "Loot", value: `${opponent.loot} 💵`, inline: true },
           { name: "Dicas", value: "Use !atk para ataques basicos e !m1/!m2/!m3 para magias. O oponente ataca automaticamente." }
         ]
       });
@@ -1110,7 +1110,7 @@ client.on("messageCreate", async (message) => {
       if (session.opponentHp <= 0) {
         const reward = session.opponent.loot;
         await updateUserVitals(message.guild.id, message.author.id, session.playerHp, session.playerMana, reward);
-        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} :dolar: adicionado ao inventario.`, message.channel);
+        await endBattle(message.author.id, `Vitoria sobre ${session.opponent.name}! Loot: ${reward} 💵 adicionado ao inventario.`, message.channel);
         return;
       }
       battleSessions.set(message.author.id, session);
@@ -1128,7 +1128,7 @@ client.on("messageCreate", async (message) => {
         { name: "Nivel", value: `${level}`, inline: true },
         { name: "Para o proximo", value: `${toNext} XP`, inline: true },
         { name: "TK", value: `${tk}`, inline: true },
-        { name: ":dolar:", value: `${money}`, inline: true }
+        { name: "💵", value: `${money}`, inline: true }
       ];
 
       const embed = new EmbedBuilder()
@@ -1319,7 +1319,7 @@ client.on("messageCreate", async (message) => {
         fields: [
           { name: "Variavel", value: variableName.toUpperCase(), inline: true },
           { name: "Valor alterado", value: `${rawValue}`, inline: true },
-          { name: "Resultado", value: `TK: ${updated.tk} | :dolar:: ${updated.money} | XP: ${updated.xp} | HP: ${updated.hp}/${updated.hpm} | ATK: ${updated.atk} | DEF: ${updated.def} | Classe: ${updated.class || "0"}` }
+          { name: "Resultado", value: `TK: ${updated.tk} | 💵: ${updated.money} | XP: ${updated.xp} | HP: ${updated.hp}/${updated.hpm} | ATK: ${updated.atk} | DEF: ${updated.def} | Classe: ${updated.class || "0"}` }
         ]
       });
       return message.reply({ embeds: [embed] });
